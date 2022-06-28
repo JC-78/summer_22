@@ -1,0 +1,312 @@
+---
+title: "Analysis: Predicting House Transaction Prices"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library("lfe")
+library("stargazer")
+library("forecast")
+library("caret")
+library("rpart.plot")
+library("ggplot2")
+library("entropy")
+library(tidyverse)
+library(rpart)
+library(xgboost)
+```
+
++---------------------------------------------------------------------------------------------------+
+| Goal: The goal is this analysis is to estimate the "irreducible errors" in property sales prices. |
++---------------------------------------------------------------------------------------------------+
+| We achieve that by comparing different models and see what the "best" model can achieve.          |
++---------------------------------------------------------------------------------------------------+
+
+# Read data
+
+```{r}
+df = read.csv('df_selected_final.csv',sep = ',',header = TRUE)
+```
+
+-   create variables needed
+
+```{r}
+# original floorsize is logged
+df$floorSize = exp(df$floorSize)
+df$floorSize_sq = df$floorSize*df$floorSize
+
+# check on the lot size (data does not match with the website description)
+
+# create variables to define the difference between transaction prices and z-estimates
+df$zest2price = (df$zestimate-df$price)/df$price
+df$price2zest = (df$price-df$zestimate)/df$zestimate
+df$zest2price_adj = (df$zestimate-df$price*1.16)/(df$price*1.16)
+df$price2zest_adj = (df$price*1.16-df$zestimate)/df$zestimate
+```
+
+-   filter outliers
+
+```{r}
+df = subset(df, (df$beds>=2)&(df$beds<=6))
+df = subset(df, (df$yearBuilt<=150))
+df = subset(df, (df$roomCount>=2))
+df = subset(df, (df$floorSize>=800))
+df = subset(df, (df$floorSize<=4500))
+df = subset(df, (df$stories)<=8)
+
+df$quarter = ifelse(df$month<=3, 1,ifelse(df$month<=6, 2,ifelse(df$month<=9, 3, 4)))
+```
+
+-   filter out properties of whice the z-estimates are not accurate it likely is indicating that the transaction prices might be very off.
+
+```{r}
+df_sample = subset(df, (df$price2zest_adj<0.5) & (df$zest2price_adj<0.5))
+# df_sample = df
+ggplot(df_sample, aes(x = zest2price_adj))+
+  geom_histogram(bins = 20)
+
+```
+
+-   data partition: define in and out sample
+
+```{r}
+df1=read.csv('TL_features.csv',sep=',',header=TRUE)
+dim(df_sample)
+dim(df1)
+df2<-merge(df_sample,df1,by="zpid")
+dim(df2)
+```
+
+```{r}
+#for reproducibility 
+set.seed(1)
+df2$area=as.factor(df2$area) 
+df2$quarter=as.factor(df2$quarter)
+
+tr_rows = sample(row.names(df2),500)
+ts_rows = setdiff(row.names(df2),tr_rows)
+df_tr = df2[tr_rows,]
+df_ts = df2[ts_rows,]
+
+```
+
+-   Next, our goal is to estimate irreducible errors by seeing what the best model(s) can predict
+
+# Model 1: linear model
+
+```{r}
+#brute force hard-coding
+reg_linear = lm(price~lot+beds+bathFull+bathHalf+roomCount
+           +floorSize+floorSize_sq
+           +solarPotential+stories
+           +yearBuilt
+           +as.factor(area) + as.factor(quarter)+feature_1+feature_2+feature_3++feature_4+feature_5+feature_6+feature_7+feature_8+feature_9+feature_10+feature_11+feature_12+feature_13+feature_14+feature_15+feature_16+feature_17+feature_18+feature_19+feature_20+feature_21+feature_22+feature_23+feature_24+feature_25+feature_26+feature_27+feature_28+feature_29+feature_30+feature_31+feature_32
+         , data=df_tr)
+summary(reg_linear)
+```
+
+Wanted to make a generalizable code regardless of neuron number other than 32. Failed 
+https://stackoverflow.com/questions/9238038/pass-a-vector-of-variables-into-lm-formula
+Method in link above can't be applied since we need to use as.factor(). Thus, I applied as.factor() previously in data pre-processing instead of in modelling. 
+ 
+```{r}
+
+#names(df2)[42:73]
+#length(names(df2)[42:73])
+k<-names(df2)[42:73] 
+#73-42+1=32. Just change the number here to account for different number of neurons.
+#ex. For 64 neurons, k<-names(df2)[42:136] to get features 1 to features 64
+
+k1<-c("lot","beds","bathFull","bathHalf","roomCount","floorSize","floorSize_sq","solarPotential","stories","yearBuilt","area","quarter")
+k2<-c(k,k1)
+k3<-paste(k2,sep="+")
+
+reg_linear <- lm(as.formula(paste("price", paste(k3, sep = "", 
+                              collapse = " + "), sep = " ~ ")),data=df_tr)
+summary(reg_linear)
+```
+
+```{r}
+accuracy(predict(reg_linear, newdata = df_tr), df_tr$price)
+accuracy(predict(reg_linear, newdata = df_ts), df_ts$price)
+res=c()
+res=c(res,accuracy(predict(reg_linear, newdata = df_ts), df_ts$price)[5])
+```
+
+# Model 2: regression tree
+
+```{r}
+set.seed(2)
+
+tree.fit1 <- train(price ~ lot+beds+bathFull+bathHalf+roomCount
+                           +floorSize
+                           +solarPotential+stories
+                           +yearBuilt
+                           +as.factor(area) + as.factor(quarter) + as.factor(quarter)+feature_1+feature_2+feature_3++feature_4+feature_5+feature_6+feature_7+feature_8+feature_9+feature_10+feature_11+feature_12+feature_13+feature_14+feature_15+feature_16+feature_17+feature_18+feature_19+feature_20+feature_21+feature_22+feature_23+feature_24+feature_25+feature_26+feature_27+feature_28+feature_29+feature_30+feature_31+feature_32
+                           #+ as.factor(dow) + latitude + longitude + rentZestimate 
+                   ,data=df_tr, method = 'rpart', 
+                   trControl=trainControl(method = 'cv', number=3),
+                   #tuneLength = 60,
+                   # parms=list(split='information')  # "gini"
+                   tuneGrid = data.frame(cp = c(0.005, 0.01,0.02,0.03,0.04,0.05)),# 0.001,0.005,
+)
+
+```
+
+```{r}
+plot(tree.fit1)
+
+tree.fit1$finalModel$tuneValue
+
+rpart.plot(tree.fit1$finalModel)
+
+importance=varImp(tree.fit1)$importance
+featureImportance <- data.frame(Feature=row.names(importance), Importance=importance[,1])
+ggplot(featureImportance, aes(x=reorder(Feature, Importance), y=Importance)) +
+  geom_bar(stat="identity") +
+  coord_flip() + 
+  xlab("variables") +
+  ylab("Importance") + 
+  ggtitle("Feature Importance\n")
+```
+
+```{r}
+accuracy(predict(tree.fit1, newdata = df_tr), df_tr$price)
+accuracy(predict(tree.fit1, newdata = df_ts), df_ts$price)
+res=c(res,accuracy(predict(tree.fit1, newdata = df_ts), df_ts$price)[5])
+res
+```
+
+# Model 3: SVM (radial)
+
+```{r}
+set.seed(2)
+
+svmFit_radial = train(price~lot+ beds+bathFull+bathHalf+roomCount#
+                   +floorSize
+                   +solarPotential+stories
+                   +yearBuilt
+                   +as.factor(area) + as.factor(quarter) + as.factor(quarter)+feature_1+feature_2+feature_3++feature_4+feature_5+feature_6+feature_7+feature_8+feature_9+feature_10+feature_11+feature_12+feature_13+feature_14+feature_15+feature_16+feature_17+feature_18+feature_19+feature_20+feature_21+feature_22+feature_23+feature_24+feature_25+feature_26+feature_27+feature_28+feature_29+feature_30+feature_31+feature_32
+                   #+ as.factor(dow) + latitude + longitude + rentZestimate 
+                , data = df_tr,
+                method = "svmRadial",   # Radial kernel
+                tuneLength = 10,					# try 10 different values for each parameter
+                # tuneGrid = expand.grid(sigma = c(0.01,0.1,0.2), 
+                #                        C = c(0.25,0.5,0.75,1,1.25,1.5)),
+                preProc = c("center","scale"),  # Center and scale data
+                trControl=trainControl(method = 'cv', number=3)
+               )
+```
+
+```{r}
+svmFit_radial$finalModel
+plot(svmFit_radial)
+
+accuracy(predict(svmFit_radial, newdata = df_tr), df_tr$price)
+accuracy(predict(svmFit_radial, newdata = df_ts), df_ts$price)
+res=c(res,accuracy(predict(svmFit_radial, newdata = df_ts), df_ts$price)[5])
+res
+```
+
+# \* Model 3B (TRY?) SVM with alternative kennels
+
+-   try with linear and polynomial kettles (refer to in-class materials)
+
+# \* Model 4 (TRY?): XG-Boost
+
+-   reference: <https://www.kaggle.com/code/nagsdata/simple-r-xgboost-caret-kernel/script>
+
+```{r}
+trctrl <- trainControl(method = "cv", number = 5)
+
+tune_grid <- expand.grid(nrounds = 200,
+                        max_depth = 5,
+                        eta = 0.05,
+                        gamma = 0.01,
+                        colsample_bytree = 0.75,
+                        min_child_weight = 0,
+                        subsample = 0.5)
+
+rf_fit <- train(price~lot+ beds+bathFull+bathHalf+roomCount#
+                   +floorSize
+                   +solarPotential+stories
+                   +yearBuilt
+                   +as.factor(area) + as.factor(quarter)+ as.factor(quarter)+feature_1+feature_2+feature_3++feature_4+feature_5+feature_6+feature_7+feature_8+feature_9+feature_10+feature_11+feature_12+feature_13+feature_14+feature_15+feature_16+feature_17+feature_18+feature_19+feature_20+feature_21+feature_22+feature_23+feature_24+feature_25+feature_26+feature_27+feature_28+feature_29+feature_30+feature_31+feature_32 , data = df_tr, method = "xgbTree",
+                trControl=trctrl,
+                tuneGrid = tune_grid,
+                tuneLength = 10)
+
+# have a look at the model 
+rf_fit
+
+# Testing
+accuracy(predict(rf_fit, df_ts),df_ts$price)
+
+
+res=c(res,accuracy(predict(rf_fit, df_ts),df_ts$price)[5])
+res
+```
+```{r}
+mape <- function(actual,pred){
+           mape <- mean(abs((actual - pred)/actual))*100
+           return (mape)
+         }
+mape(df_ts$price,predict(rf_fit, df_ts))
+```
+
+I wrote function to calculate MAPE, just to ensure the resulting MAPE value is correct.
+
+# \* Model 5: Other models you could search and think of?
+LightGBM, GAM in other R file
+
+# \* Model 6 (TRY?): Ensemble
+
+```{r}
+## EXAMPLE
+predY_regLinear = predict(reg_linear, newdata = df_tr)
+predY_rTree = predict(tree.fit1, newdata = df_tr)
+predY_svmRadial = predict(svmFit_radial, newdata = df_tr)
+predY_ensemble = (predY_regLinear+predY_rTree+predY_svmRadial)/3
+accuracy(predY_ensemble, df_tr$price)
+
+
+predY_regLinear = predict(reg_linear, newdata = df_ts)
+predY_rTree = predict(tree.fit1, newdata = df_ts)
+predY_svmRadial = predict(svmFit_radial, newdata = df_ts)
+predY_ensemble = (predY_regLinear+predY_rTree+predY_svmRadial)/3
+accuracy(predY_ensemble, df_ts$price)
+
+```
+
+```{r}
+#xgboost addition
+predY_xgboost <- predict(rf_fit, df_ts)
+predY_ensemble = (predY_regLinear+predY_rTree+predY_svmRadial+predY_xgboost)/4
+accuracy(predY_ensemble, df_ts$price)
+```
+
+```{r}
+res=c(res,accuracy(predY_ensemble, df_ts$price)[5])
+res #linear regression, reg tree,svm,xgboost,ensemble of previous 4 models
+```
+
+```{r}
+res1<-data.frame(res)
+write.csv(res1, file = "my_data.csv")
+
+```
+
++---------------------------------------------------------------------------------------------------+
+|                                   Preparing for next week                                         |
++---------------------------------------------------------------------------------------------------+
+# \* a seperate task if you have time: explore transfer learning.
+
+References: 
+1. <https://neptune.ai/blog/transfer-learning-guide-examples-for-images-and-text-in-keras> 
+2. <https://colab.research.google.com/github/kylemath/ml4a-guides/blob/master/notebooks/transfer-learning.ipynb>
+
+If you have not, please download ipython-notebook in your laptop. We will use that to apply transfer learning. Reference: <https://towardsdatascience.com/how-to-set-up-anaconda-and-jupyter-notebook-the-right-way-de3b7623ea4a>
