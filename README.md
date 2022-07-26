@@ -7,4 +7,7 @@
 
 -CMU lab's PyTorch model toolkit extension
 
+-Time series survival analysis:
+•Explores Kaplan-Meier Curve, survival regression and Cox Proportional Hazards Model
+
 -LSTM practice/project: Apple stock prediction
